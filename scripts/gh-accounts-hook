@@ -1,0 +1,83 @@
+#!/usr/bin/env bash
+# gh-accounts-hook: global git hook for gh-account-switcher.
+#
+# Installed into a global core.hooksPath folder and symlinked under every hook
+# name. For "pre-push" it first checks that gh's active account matches the
+# GitHub owner of the repo being pushed to. Then, for every hook name, it runs
+# the repo's own .git/hooks/<name> if there is one, so per-repo hooks keep working.
+#
+# Skip the check for one push:  GH_ACCOUNTS_GUARD=off git push
+# Map orgs to accounts:         ~/.config/gh-accounts/owners  ("<owner> <gh-login>" per line)
+
+hook_name=$(basename "$0")
+host="${GH_ACCOUNTS_HOST:-github.com}"
+config_dir="${XDG_CONFIG_HOME:-$HOME/.config}/gh-accounts"
+state_file="${XDG_STATE_HOME:-$HOME/.local/state}/gh-accounts/active"
+
+lower() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]'; }
+
+check_push_account() {
+    local url="$1" owner status active accounts expected line
+    [ "${GH_ACCOUNTS_GUARD:-on}" = off ] && return 0
+
+    # Only HTTPS remotes go through gh; SSH remotes use keys, which gh doesn't control.
+    case "$url" in
+        https://"$host"/*|https://*@"$host"/*) ;;
+        *) return 0 ;;
+    esac
+    owner=$(printf '%s' "$url" | sed -E "s#^https://([^@/]+@)?$host/##; s#/.*##")
+    [ -n "$owner" ] || return 0
+
+    command -v gh >/dev/null || return 0
+    status=$(gh auth status --hostname "$host" 2>&1) || true
+    accounts=$(printf '%s\n' "$status" | awk '/Logged in to .* account / { for (i = 1; i <= NF; i++) if ($i == "account") print $(i + 1) }')
+    active=$(printf '%s\n' "$status" | awk '
+        /Logged in to .* account / { for (i = 1; i <= NF; i++) if ($i == "account") login = $(i + 1) }
+        /Active account: true/      { print login; exit }')
+    if [ -z "$active" ]; then
+        echo "gh-accounts: couldn't tell which gh account is active; not checking this push." >&2
+        return 0
+    fi
+    mkdir -p "$(dirname "$state_file")" 2>/dev/null && printf '%s\n' "$active" >"$state_file" 2>/dev/null
+
+    # Owner is one of your own accounts -> that account must push.
+    expected=$(printf '%s\n' "$accounts" | while read -r a; do
+        [ "$(lower "$a")" = "$(lower "$owner")" ] && echo "$a"; done | head -1)
+    # Otherwise (an org or someone else's repo) -> look it up in the owners file.
+    if [ -z "$expected" ] && [ -r "$config_dir/owners" ]; then
+        while read -r o login _; do
+            case "$o" in ''|'#'*) continue ;; esac
+            [ "$(lower "$o")" = "$(lower "$owner")" ] && { expected=$login; break; }
+        done <"$config_dir/owners"
+    fi
+
+    if [ -z "$expected" ]; then
+        echo "gh-accounts: pushing to $owner as $active." >&2
+        return 0
+    fi
+    if [ "$(lower "$expected")" != "$(lower "$active")" ]; then
+        {
+            if [ "$(lower "$owner")" = "$(lower "$expected")" ]; then
+                echo "✘ gh-accounts: this repo belongs to your account $expected,"
+            else
+                echo "✘ gh-accounts: $owner repos are pushed as $expected (from $config_dir/owners),"
+            fi
+            echo "  but the active account is $active. Nothing was pushed."
+            echo "  Switch with your shortcut for $expected (see: gh_who), then push again."
+            echo "  To push as $active anyway: GH_ACCOUNTS_GUARD=off git push ..."
+        } >&2
+        return 1
+    fi
+    return 0
+}
+
+if [ "$hook_name" = pre-push ]; then
+    check_push_account "$2" || exit 1
+fi
+
+# Hand over to the repo's own hook, if any (stdin is passed through untouched).
+repo_hooks="$(git rev-parse --git-common-dir 2>/dev/null)/hooks"
+if [ -x "$repo_hooks/$hook_name" ]; then
+    exec "$repo_hooks/$hook_name" "$@"
+fi
+exit 0
